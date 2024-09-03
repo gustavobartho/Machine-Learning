@@ -1,0 +1,16 @@
+.ipynb_checkpoints
+__pycache__
+nvvm
+libdevice.10.bc
+datasets
+data
+models
+networks
+*.h5
+.vscode
+*.p
+*.tar.gz
+*.txt
+*.png
+*.pkl
+*.jpg
