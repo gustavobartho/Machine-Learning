@@ -1,7 +1,7 @@
 import gym, warnings
 import tensorflow as tf, matplotlib.pyplot as plt, numpy as np
 
-from tensorflow.keras.layers import Input, Concatenate, Lambda, Layer, Reshape, Dense, BatchNormalization, Input, Dense, LayerNormalization, Dropout, MultiHeadAttention, Concatenate, Reshape, Lambda, Attention
+from tensorflow.keras.layers import Input, Concatenate, Lambda, Layer, Reshape, Dense, BatchNormalization
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.optimizers.schedules import ExponentialDecay
@@ -195,15 +195,15 @@ class InstinctiveNetwork:
 class TransformerBlock(tf.keras.layers.Layer):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
         super(TransformerBlock, self).__init__()
-        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.att = tf.keras.layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
         self.ffn = tf.keras.Sequential([
-            Dense(ff_dim, activation="relu"),
-            Dense(embed_dim),
+            tf.keras.layers.Dense(ff_dim, activation="relu"),
+            tf.keras.layers.Dense(embed_dim),
         ])
-        self.layernorm1 = LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = LayerNormalization(epsilon=1e-6)
-        self.dropout1 = Dropout(rate)
-        self.dropout2 = Dropout(rate)
+        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = tf.keras.layers.Dropout(rate)
+        self.dropout2 = tf.keras.layers.Dropout(rate)
 
     def call(self, inputs, training):
         attn_output = self.att(inputs, inputs)
@@ -248,12 +248,12 @@ class MultiHeadActor(object):
                     bias_initializer=tf.random_uniform_initializer(-f1, f1), 
                     dtype='float64')(inp)
         norm1 = BatchNormalization(dtype='float64')(fc1)  # Batch normalization
-
-        tf = TransformerBlock(self.s_fc1_dim, 4, self.fc2_dim)(norm1)
-        tf = TransformerBlock(self.s_fc1_dim, 4, self.fc2_dim)(tf)
         
+        x = TransformerBlock(self.s_fc1_dim, 4, self.fc2_dim)(norm1)
+        x = TransformerBlock(self.s_fc1_dim, 4, self.fc2_dim)(x)
+
         # Second fully connected layer
-        fc2 = NoisyDense(self.fc2_dim, activation='relu')(tf)
+        fc2 = NoisyDense(self.fc2_dim, activation='relu')(x)
         norm2 = BatchNormalization(dtype='float64')(fc2)
 
         # Third fully connected layer
@@ -427,9 +427,6 @@ class DDPGAgent(object):
         self.max_steps = max_steps
         self.env_name = env_name
         self.n_kernels = n_kernels
-        self.policy_noise = 0.2
-        self.noise_clip = 0.5
-        self.policy_delay = 2
 
         # Initialize replay buffer
         self.memory = PrioritizedReplayBuffer(memory_size, batch_size)
@@ -508,48 +505,34 @@ class DDPGAgent(object):
 
     @tf.function
     def update_nets(self, weights, states, actions, rewards, next_states, dones, kernel_probs):
-        # Update critics
-        with tf.GradientTape(persistent=True) as tape:
+        # Update critic network
+        with tf.GradientTape() as tape:
             target_actions = self.actor.target_predict(next_states)
-            target_noise = tf.clip_by_value(tf.random.normal(tf.shape(target_actions), stddev=self.policy_noise), -self.noise_clip, self.noise_clip)
-            target_actions = tf.clip_by_value(target_actions + target_noise, self.action_min, self.action_max)
+            kernel_probs_expanded = tf.expand_dims(kernel_probs, axis=-1)
+            weighted_target_actions = tf.reduce_sum(target_actions * kernel_probs_expanded, axis=1)
             
-            target_q1 = self.critic.target_predict(next_states, target_actions)
-            target_q2 = self.critic2.target_predict(next_states, target_actions)
-            target_q = tf.minimum(target_q1, target_q2)
-            
-            y = rewards + self.gamma * target_q * (1 - dones)
-            
-            critic_value1 = self.critic.predict(states, actions)
-            critic_loss1 = tf.reduce_mean(weights * tf.square(y - critic_value1))
-            
-            critic_value2 = self.critic2.predict(states, actions)
-            critic_loss2 = tf.reduce_mean(weights * tf.square(y - critic_value2))
+            y = rewards + self.gamma * self.critic.target_predict(next_states, weighted_target_actions) * (1 - dones)
+            critic_value = self.critic.predict(states, actions)
+            critic_loss = tf.reduce_mean(weights * tf.square(y - critic_value))
 
-        critic_grad1 = tape.gradient(critic_loss1, self.critic.model.trainable_variables)
-        self.critic.optimizer.apply_gradients(zip(critic_grad1, self.critic.model.trainable_variables))
-
-        critic_grad2 = tape.gradient(critic_loss2, self.critic2.model.trainable_variables)
-        self.critic2.optimizer.apply_gradients(zip(critic_grad2, self.critic2.model.trainable_variables))
-
-        # Delayed policy updates
-        if self.total_it % self.policy_delay == 0:
-            # Update actor
-            with tf.GradientTape() as tape:
-                actions = self.actor.predict(states)
-                critic_value = self.critic.predict(states, actions)
-                actor_loss = -tf.reduce_mean(weights * critic_value)
-                
-            actor_grad = tape.gradient(actor_loss, self.actor.model.trainable_variables)
-            self.actor.optimizer.apply_gradients(zip(actor_grad, self.actor.model.trainable_variables))
+        critic_grad = tape.gradient(critic_loss, self.critic.model.trainable_variables)
+        self.critic.optimizer.apply_gradients(zip(critic_grad, self.critic.model.trainable_variables))
+        
+        # Update actor network
+        with tf.GradientTape() as tape:
+            actions = self.actor.predict(states)
+            weighted_actions = tf.reduce_sum(actions * kernel_probs_expanded, axis=1)
+            critic_value = self.critic.predict(states, weighted_actions)
+            actor_loss = -tf.reduce_mean(weights * critic_value)
             
-            # Update target networks
-            self.actor.transferWeights()
-            self.critic.transferWeights()
-            self.critic2.transferWeights()
+        actor_grad = tape.gradient(actor_loss, self.actor.model.trainable_variables)
+        self.actor.optimizer.apply_gradients(zip(actor_grad, self.actor.model.trainable_variables))
+        
+        # Soft update target networks
+        self.actor.transferWeights()
+        self.critic.transferWeights()
 
-        self.total_it += 1
-        return y, critic_value1
+        return y, critic_value
 
 
     def learn(self, state, action, reward, next_state, done, kernel_probs):

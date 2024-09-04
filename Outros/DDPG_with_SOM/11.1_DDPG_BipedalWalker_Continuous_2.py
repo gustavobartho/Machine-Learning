@@ -110,7 +110,7 @@ class PrioritizedReplayBuffer:
     def update_priorities(self, indices, priorities):
         # Update priorities for the sampled experiences
         for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority + 1e-5  # Add small constant to avoid zero priority
+            self.priorities[idx] = priority + 1e-6  # Add small constant to avoid zero priority
 
 
     def isMin(self):
@@ -203,12 +203,7 @@ class MultiHeadActor(object):
         self.n_kernels = n_kernels  # Number of output heads (kernels)
         self.act_range = act_range  # Action range for scaling the output
         self.tau = tau  # Soft update parameter for target network
-        self.lr_schedule = ExponentialDecay(
-            initial_learning_rate=lr,
-            decay_steps=10000,
-            decay_rate=0.99
-        )
-        self.optimizer = Adam(learning_rate=self.lr_schedule)
+        self.optimizer = Adam(learning_rate=lr)
         self.model = self.buildNetwork()  # Build the main network
         self.target_model = self.buildNetwork()  # Build the target network
         self.target_model.set_weights(self.model.get_weights())  # Initialize target network weights
@@ -223,23 +218,19 @@ class MultiHeadActor(object):
         fc1 = Dense(self.s_fc1_dim, activation='relu', 
                     kernel_initializer=tf.random_uniform_initializer(-f1, f1), 
                     bias_initializer=tf.random_uniform_initializer(-f1, f1), 
-                    dtype='float64')(inp)
-        norm1 = BatchNormalization(dtype='float64')(fc1)  # Batch normalization
+                    dtype='float32')(inp)
+        norm1 = BatchNormalization(dtype='float32')(fc1)  # Batch normalization
         
         # Second fully connected layer
         fc2 = NoisyDense(self.fc2_dim, activation='relu')(norm1)
-        norm2 = BatchNormalization(dtype='float64')(fc2)
+        norm2 = BatchNormalization(dtype='float32')(fc2)
 
         # Third fully connected layer
-        f3 = 1 / np.sqrt(self.fc3_dim)
-        fc3 = Dense(self.fc3_dim, activation='relu', 
-                    kernel_initializer=tf.random_uniform_initializer(-f3, f3), 
-                    bias_initializer=tf.random_uniform_initializer(-f3, f3), 
-                    dtype='float64')(norm2)
-        norm3 = BatchNormalization(dtype='float64')(fc3)
+        fc3 =NoisyDense(self.fc3_dim, activation='relu')(norm2)
+        norm3 = BatchNormalization(dtype='float32')(fc3)
 
         # Multiple output heads, one for each kernel
-        outputs = [NoisyDense(self.out_dim, activation='tanh')(norm3) for _ in range(self.n_kernels)]
+        outputs = [Dense(self.out_dim, activation='tanh')(norm3) for _ in range(self.n_kernels)]
         outputs = Concatenate(axis=-1)(outputs)  # Concatenate all outputs
         outputs = Reshape((self.n_kernels, self.out_dim))(outputs)  # Reshape to (n_kernels, out_dim)
         outputs = Lambda(lambda x: x * self.act_range)(outputs)  # Scale outputs to action range
@@ -277,15 +268,8 @@ class Critic(object):
         self.conc_fc1_dim = conc_fc1_dim
         self.out_dim = out_dim
         
-        # Set up learning rate schedule
-        self.lr_schedule = ExponentialDecay(
-            initial_learning_rate=lr,
-            decay_steps=10000,
-            decay_rate=0.99
-        )
-        
         # Initialize optimizer
-        self.optimizer = Adam(learning_rate=self.lr_schedule)
+        self.optimizer = Adam(learning_rate=lr)
         
         # Parameter for soft updates of target network
         self.tau = tau
@@ -406,14 +390,14 @@ class DDPGAgent(object):
         self.memory = PrioritizedReplayBuffer(memory_size, batch_size)
 
         # Initialize SOM-based instinctive network
-        som_dim = (20, 20)
+        som_dim = (15, 15)
         self.inst_net = InstinctiveNetwork(
             som_dim=som_dim[0], 
             input_dim=self.state_dim,
             n_kernels=self.n_kernels,
             som_kwargs = {
-                'sigma': 0.7,
-                'learning_rate': 0.01,
+                'sigma': 1,
+                'learning_rate': 0.05,
                 'neighborhood_function': 'gaussian',
                 'random_seed': 42,
                 'decay_function': lambda x, y, z: x,
@@ -460,7 +444,7 @@ class DDPGAgent(object):
 
     def update_plots(self, som_act):
         # Update the SOM activation plot
-        self.som_act_plot.imshow(som_act)
+        self.som_act_plot.imshow(np.array(som_act))
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
         return
@@ -486,7 +470,8 @@ class DDPGAgent(object):
             weighted_target_actions = tf.reduce_sum(target_actions * kernel_probs_expanded, axis=1)
             
             y = rewards + self.gamma * self.critic.target_predict(next_states, weighted_target_actions) * (1 - dones)
-            critic_value = self.critic.predict(states, actions)
+            y = tf.cast(y, dtype=tf.float32)
+            critic_value = tf.cast(self.critic.predict(states, actions), dtype=tf.float32)
             critic_loss = tf.reduce_mean(weights * tf.square(y - critic_value))
 
         critic_grad = tape.gradient(critic_loss, self.critic.model.trainable_variables)
@@ -528,6 +513,7 @@ class DDPGAgent(object):
         dones = tf.convert_to_tensor([exp[4] for exp in experiences], dtype=tf.float32)
         kernel_probs = tf.convert_to_tensor([exp[5] for exp in experiences], dtype=tf.float32)
 
+        weights = tf.cast(weights, dtype=tf.float32)
         y, critic_value = self.update_nets(weights, states, actions, rewards, next_states, dones, kernel_probs)
 
         # Update priorities in the replay buffer
@@ -575,7 +561,9 @@ class DDPGAgent(object):
             while not done:
                 action, som_act, kernel_probs = self.policy(observation)
                 
-                if verbose: print(f"\rEpisode: {episode+1} \tStep: {steps} \tReward: {score}", end="")
+                if verbose:
+                    print("\r                                                                                                     ", end="")
+                    print(f"\rEpisode: {str(episode+1)} \tStep: {str(steps)} \tReward: {str(score)}", end="")
                 
                 new_observation, reward, done, _, _ = env.step(action.numpy())
                 
@@ -598,6 +586,7 @@ class DDPGAgent(object):
                 if end_on_complete and complete >= complete_num: break
             
             if (episode+1) % verbose_num == 0:
+                print("\r                                                                                                          ", end="")
                 print(f'''\rEpisodes: {episode+1}/{num_episodes}\n\tTotal reward: {np.mean(scores_history[-verbose_num:])} +- {np.std(scores_history[-verbose_num:])}\n\tNum. steps: {np.mean(steps_history[-verbose_num:])} +- {np.std(steps_history[-verbose_num:])}\n\tCompleted: {complete}\n--------------------------''')
                 
                 if act_after_batch: self.act()
@@ -617,13 +606,13 @@ action_min = env.action_space.low
 action_max = env.action_space.high
 
 memory_size = 1000000
-batch_size = 256
+batch_size = 128
 gamma = 0.99
-a_lr = 3e-4
-c_lr = 8e-4
+a_lr = 5e-4
+c_lr = 1e-3
 tau = 1e-3
 max_steps = 1000
-n_kernels = 10
+n_kernels = 3
 
 agent = DDPGAgent(
     state_dim, action_dim, action_min, action_max, 
@@ -633,7 +622,7 @@ agent = DDPGAgent(
 
 num_episodes = 3000
 verbose = True
-verbose_num = 50
+verbose_num = 10
 end_on_complete = True
 complete_num = 2
 complete_value = 300
@@ -643,5 +632,5 @@ agent.train(
     env, num_episodes, verbose, 
     verbose_num, end_on_complete, 
     complete_num, complete_value, 
-    act_after_batch, plot_act=False
+    act_after_batch, plot_act=True
 )
