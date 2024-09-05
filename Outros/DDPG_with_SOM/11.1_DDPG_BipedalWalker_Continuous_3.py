@@ -1,7 +1,7 @@
 import gym
 import tensorflow as tf, matplotlib.pyplot as plt, numpy as np
 
-from tensorflow.keras.layers import Input, Concatenate, Lambda, Layer, Add, Dense, BatchNormalization
+from tensorflow.keras.layers import Input, Concatenate, Lambda, Layer, Dense, BatchNormalization
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.optimizers.schedules import ExponentialDecay
@@ -10,6 +10,9 @@ from tensorflow.keras.initializers import RandomUniform
 global_seed = 42
 tf.random.set_seed(global_seed)
 np.random.seed(global_seed)
+
+
+#############################################
 
 # NoisyDense Layer: A custom layer that adds parametric noise to the weights and biases
 # This can help with exploration in reinforcement learning tasks
@@ -44,6 +47,7 @@ class NoisyDense(Layer):
         # Apply activation function if specified
         return self.activation(output) if self.activation else output
     
+##############################################
 
 class PrioritizedReplayBuffer:
 
@@ -113,6 +117,7 @@ class PrioritizedReplayBuffer:
         # Check if the buffer has enough samples for a full batch
         return self.size >= self.batch_size
 
+######################################
 
 class VAE:
     def __init__(self, input_dim, latent_dim, encoder_dims, lr):
@@ -121,7 +126,7 @@ class VAE:
         self.encoder_dims = encoder_dims
         self.lr = lr
         self.encoder = self.build_encoder()
-        self.encoder_optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+        self.encoder_optimizer = Adam(learning_rate=lr)
 
 
     def build_encoder(self):
@@ -158,14 +163,14 @@ class VAE:
         self.encoder_optimizer.apply_gradients(zip(gradients, self.encoder.trainable_variables))
 
         return total_loss, kl_loss
-
+    
+#######################################
 
 class MultiHeadActor(object):
     
-    def __init__(self, inp_dim, join_net_dims, heads_nets_dims, kernel_probs_net_dims, out_dim, n_kernels, act_range, lr, tau):
+    def __init__(self, inp_dim, heads_nets_dims, kernel_probs_net_dims, out_dim, n_kernels, act_range, lr, tau):
         # Initialize the Multi-Head Actor with given parameters
         self.inp_dim = inp_dim  # Dimension of the state input
-        self.join_net_dims = join_net_dims
         self.heads_nets_dims = heads_nets_dims
         self.kernel_probs_net_dims = kernel_probs_net_dims
         self.out_dim = out_dim  # Dimension of each output head
@@ -189,22 +194,20 @@ class MultiHeadActor(object):
         kernel_probs = z
         for dim in self.kernel_probs_net_dims:
             kernel_probs = Dense(dim, activation='relu')(kernel_probs)
+
         kernel_probs = Dense(self.n_kernels, activation='softmax')(kernel_probs)
 
-        # Join network
-        join = inp
-        for dim in self.join_net_dims:
-            join = Dense(dim, activation='relu')(join)
-            join = BatchNormalization(dtype=tf.float32)(join)
 
         # Specialist networks
         specialist_outputs = []
         for _ in range(self.n_kernels):
-            specialist = join
+            specialist = inp
             for dim in self.heads_nets_dims:
                 specialist = NoisyDense(dim, activation='relu')(specialist)
                 specialist = BatchNormalization(dtype=tf.float32)(specialist)
+
             specialist = NoisyDense(self.out_dim, activation='tanh')(specialist)
+            specialist = Lambda(lambda x: x * self.act_range)(specialist)
             specialist_outputs.append(specialist)
 
         # Gate and combine specialist outputs
@@ -213,22 +216,13 @@ class MultiHeadActor(object):
             for i, specialist in enumerate(specialist_outputs)
         ]
 
-        combined_output = Add()(gated_outputs)
+        combined_output = Concatenate(dtype=tf.float32)(gated_outputs)
 
-        # Final output
-        output = Lambda(lambda x: x * self.act_range)(combined_output)
+        output = Dense(4*self.out_dim*self.n_kernels, activation='relu')(combined_output)
+        output = NoisyDense(self.out_dim, activation='tanh')(output)
+        output = Lambda(lambda x: x * self.act_range)(output)
+
         return Model(inputs=inp, outputs=output)
-
-
-    @tf.function
-    def mixture_of_experts(self, gates, expert_outputs):
-        # Stack expert outputs
-        stacked_experts = tf.stack(expert_outputs, axis=1)
-        
-        # Apply gating
-        gated_outputs = tf.reduce_sum(tf.expand_dims(gates, -1) * stacked_experts, axis=1)
-        
-        return gated_outputs
 
 
     @tf.function
@@ -245,6 +239,8 @@ class MultiHeadActor(object):
     def transferWeights(self):
         for a, b in zip(self.target_model.variables, self.model.variables):
             a.assign(self.tau * b + (1 - self.tau) * a)
+
+#####################################
 
 class Critic(object):
     
@@ -361,6 +357,8 @@ class Critic(object):
         # Load the weights into the main network
         self.model.load_weights(path)
 
+########################################
+
 class DDPGAgent(object):
     def __init__(
         self, state_dim, action_dim, action_min, action_max, 
@@ -388,8 +386,7 @@ class DDPGAgent(object):
         # Initialize actor network
         self.actor = MultiHeadActor(
             inp_dim=self.state_dim, 
-            join_net_dims=[512, 256],
-            heads_nets_dims=[64, 64],
+            heads_nets_dims=[256, 128, 64],
             kernel_probs_net_dims = [16, 16],
             out_dim=self.action_dim,
             n_kernels=self.n_kernels,
@@ -519,7 +516,7 @@ class DDPGAgent(object):
 
     def train(
         self, env, num_episodes, verbose, verbose_num, end_on_complete, 
-        complete_num, complete_value, act_after_batch, plot_act
+        complete_num, complete_value, act_after_batch
     ):
         # Main training loop
         scores_history = []
@@ -569,7 +566,9 @@ class DDPGAgent(object):
         print("\nFINISHED")
         
         return scores_history, steps_history
+    
 
+##################################
 
 name = "BipedalWalker-v3"
 env = gym.make(name, hardcore=True)
@@ -582,11 +581,11 @@ action_max = env.action_space.high
 memory_size = 1000000
 batch_size = 256
 gamma = 0.99
-a_lr = 1e-4
+a_lr = 5e-4
 c_lr = 1e-3
-tau = 1e-3
+tau = 8e-4
 max_steps = 1000
-n_kernels = 4
+n_kernels = 5
 
 agent = DDPGAgent(
     state_dim, action_dim, action_min, action_max, 
@@ -606,5 +605,5 @@ agent.train(
     env, num_episodes, verbose, 
     verbose_num, end_on_complete,  
     complete_num, complete_value, 
-    act_after_batch, plot_act=False
+    act_after_batch
 )
