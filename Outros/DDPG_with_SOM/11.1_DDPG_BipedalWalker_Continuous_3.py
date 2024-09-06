@@ -11,8 +11,7 @@ global_seed = 42
 tf.random.set_seed(global_seed)
 np.random.seed(global_seed)
 
-
-#############################################
+########################################
 
 # NoisyDense Layer: A custom layer that adds parametric noise to the weights and biases
 # This can help with exploration in reinforcement learning tasks
@@ -47,7 +46,8 @@ class NoisyDense(Layer):
         # Apply activation function if specified
         return self.activation(output) if self.activation else output
     
-##############################################
+
+##################################################
 
 class PrioritizedReplayBuffer:
 
@@ -116,8 +116,9 @@ class PrioritizedReplayBuffer:
     def isMin(self):
         # Check if the buffer has enough samples for a full batch
         return self.size >= self.batch_size
-
-######################################
+    
+    
+#################################################
 
 class VAE:
     def __init__(self, input_dim, latent_dim, encoder_dims, lr):
@@ -126,7 +127,9 @@ class VAE:
         self.encoder_dims = encoder_dims
         self.lr = lr
         self.encoder = self.build_encoder()
+        self.decoder = self.build_decoder()
         self.encoder_optimizer = Adam(learning_rate=lr)
+        self.decoder_optimizer = Adam(learning_rate=lr)
 
 
     def build_encoder(self):
@@ -142,6 +145,17 @@ class VAE:
         return Model(inputs, [z, mean, logvar])
 
 
+    def build_decoder(self):
+        inputs = Input(shape=(self.latent_dim,))
+        x = inputs
+
+        for dim in reversed(self.encoder_dims):
+            x = Dense(dim, activation='relu')(x)
+
+        outputs = Dense(self.input_dim)(x)
+        return Model(inputs, outputs)
+    
+
     def reparameterize(self, mean, logvar):
         eps = tf.random.normal(shape=tf.shape(mean))
         return eps * tf.exp(logvar * .5) + mean
@@ -150,21 +164,32 @@ class VAE:
     @tf.function
     def encode(self, x):
         return self.encoder(x)
+    
+
+    @tf.function
+    def decode(self, z):
+        return self.decoder(z)
 
 
     @tf.function
     def train_step(self, x):
         with tf.GradientTape() as tape:
             z, mean, logvar = self.encode(x)
+            x_reconstructed = self.decode(z)
+            reconstruction_loss = tf.reduce_mean(tf.square(x - x_reconstructed))
             kl_loss = -0.5 * tf.reduce_mean(1 + logvar - tf.square(mean) - tf.exp(logvar))
-            total_loss = kl_loss
+            total_loss = reconstruction_loss + kl_loss
 
-        gradients = tape.gradient(total_loss, self.encoder.trainable_variables)
-        self.encoder_optimizer.apply_gradients(zip(gradients, self.encoder.trainable_variables))
+        gradients = tape.gradient(total_loss, self.encoder.trainable_variables + self.decoder.trainable_variables)
+        self.encoder_optimizer.apply_gradients(zip(gradients[:len(self.encoder.trainable_variables)], self.encoder.trainable_variables))
+        self.decoder_optimizer.apply_gradients(zip(gradients[len(self.encoder.trainable_variables):], self.decoder.trainable_variables))
 
-        return total_loss, kl_loss
+        return total_loss, reconstruction_loss, kl_loss
     
-#######################################
+
+
+#################################################
+
 
 class MultiHeadActor(object):
     
@@ -203,11 +228,11 @@ class MultiHeadActor(object):
         for _ in range(self.n_kernels):
             specialist = inp
             for dim in self.heads_nets_dims:
-                specialist = NoisyDense(dim, activation='relu')(specialist)
-                specialist = BatchNormalization(dtype=tf.float32)(specialist)
+                specialist = Dense(dim, activation='relu')(specialist)
+                specialist = Dropout(0.2)(specialist)
 
-            specialist = NoisyDense(self.out_dim, activation='tanh')(specialist)
-            specialist = Lambda(lambda x: x * self.act_range)(specialist)
+            specialist = Dense(tf.round(self.out_dim/self.n_kernels))(specialist)
+            specialist = Dropout(0.2)(specialist)
             specialist_outputs.append(specialist)
 
         # Gate and combine specialist outputs
@@ -217,8 +242,10 @@ class MultiHeadActor(object):
         ]
 
         combined_output = Concatenate(dtype=tf.float32)(gated_outputs)
-
         output = Dense(4*self.out_dim*self.n_kernels, activation='relu')(combined_output)
+
+        output = NoisyDense(self.out_dim, activation='relu')(output)
+        output = NoisyDense(self.out_dim, activation='relu')(output)
         output = NoisyDense(self.out_dim, activation='tanh')(output)
         output = Lambda(lambda x: x * self.act_range)(output)
 
@@ -240,7 +267,9 @@ class MultiHeadActor(object):
         for a, b in zip(self.target_model.variables, self.model.variables):
             a.assign(self.tau * b + (1 - self.tau) * a)
 
-#####################################
+
+########################################
+
 
 class Critic(object):
     
@@ -357,6 +386,8 @@ class Critic(object):
         # Load the weights into the main network
         self.model.load_weights(path)
 
+
+
 ########################################
 
 class DDPGAgent(object):
@@ -386,7 +417,7 @@ class DDPGAgent(object):
         # Initialize actor network
         self.actor = MultiHeadActor(
             inp_dim=self.state_dim, 
-            heads_nets_dims=[256, 128, 64],
+            heads_nets_dims=[512, 256, 128, 64],
             kernel_probs_net_dims = [16, 16],
             out_dim=self.action_dim,
             n_kernels=self.n_kernels,
@@ -544,7 +575,7 @@ class DDPGAgent(object):
                     reward = -50
                     done = True
 
-                self.learn(observation, action.numpy(), reward*2, new_observation, done)
+                self.learn(observation, action.numpy(), reward, new_observation, done)
                 observation = new_observation
                 score += reward
                 steps += 1
@@ -566,9 +597,10 @@ class DDPGAgent(object):
         print("\nFINISHED")
         
         return scores_history, steps_history
-    
 
-##################################
+
+########################################
+
 
 name = "BipedalWalker-v3"
 env = gym.make(name, hardcore=True)
@@ -579,19 +611,20 @@ action_min = env.action_space.low
 action_max = env.action_space.high
 
 memory_size = 1000000
-batch_size = 256
+batch_size = 128
 gamma = 0.99
-a_lr = 5e-4
+a_lr = 1e-4
 c_lr = 1e-3
-tau = 8e-4
+tau = 5e-3
 max_steps = 1000
-n_kernels = 5
+n_kernels = 3
 
 agent = DDPGAgent(
     state_dim, action_dim, action_min, action_max, 
     memory_size, batch_size, gamma, a_lr, c_lr, tau, 
     max_steps, name, n_kernels,
 )
+
 
 num_episodes = 3000
 verbose = True
