@@ -1,7 +1,7 @@
 import gym
 import tensorflow as tf, matplotlib.pyplot as plt, numpy as np
 
-from tensorflow.keras.layers import Input, Concatenate, Lambda, Layer, Dense, BatchNormalization
+from tensorflow.keras.layers import Input, Concatenate, Lambda, Layer, Dense, BatchNormalization, Dropout
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.optimizers.schedules import ExponentialDecay
@@ -51,7 +51,7 @@ class NoisyDense(Layer):
 
 class PrioritizedReplayBuffer:
 
-    def __init__(self, capacity, batch_size, alpha=0.3, beta=0.2, beta_increment=0.003):
+    def __init__(self, capacity, batch_size, alpha=0.6, beta=0.4, beta_increment=1e-3):
         # Initialize buffer parameters
         self.capacity = capacity  # Maximum number of experiences to store
         self.batch_size = batch_size  # Number of experiences to sample in each batch
@@ -110,7 +110,7 @@ class PrioritizedReplayBuffer:
     def update_priorities(self, indices, priorities):
         # Update priorities for the sampled experiences
         for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority + 1e-5  # Add small constant to avoid zero priority
+            self.priorities[idx] = priority + 1e-6  # Add small constant to avoid zero priority
 
 
     def isMin(self):
@@ -179,7 +179,7 @@ class VAE:
             reconstruction_loss = tf.reduce_mean(tf.square(x - x_reconstructed))
             kl_loss = -0.5 * tf.reduce_mean(1 + logvar - tf.square(mean) - tf.exp(logvar))
             total_loss = reconstruction_loss + kl_loss
-
+            
         gradients = tape.gradient(total_loss, self.encoder.trainable_variables + self.decoder.trainable_variables)
         self.encoder_optimizer.apply_gradients(zip(gradients[:len(self.encoder.trainable_variables)], self.encoder.trainable_variables))
         self.decoder_optimizer.apply_gradients(zip(gradients[len(self.encoder.trainable_variables):], self.decoder.trainable_variables))
@@ -203,7 +203,7 @@ class MultiHeadActor(object):
         self.act_range = act_range  # Action range for scaling the output
         self.tau = tau  # Soft update parameter for target network
 
-        self.vae = VAE(input_dim=inp_dim, latent_dim=8, encoder_dims=[64, 32], lr=1e-3)
+        self.vae = VAE(input_dim=inp_dim, latent_dim=8, encoder_dims=[16, 8], lr=5e-4)
 
         self.model = self.buildNetwork()
         self.target_model = self.buildNetwork()
@@ -213,14 +213,15 @@ class MultiHeadActor(object):
 
     def buildNetwork(self):
         inp = Input(shape=(self.inp_dim,))
-        z, _, _ = self.vae.encoder(inp)
+        # z, _, _ = self.vae.encoder(inp)
         
-        # Kernel probabilities network
-        kernel_probs = z
-        for dim in self.kernel_probs_net_dims:
-            kernel_probs = Dense(dim, activation='relu')(kernel_probs)
+        # # Kernel probabilities network
+        # kernel_probs = z
+        # for dim in self.kernel_probs_net_dims:
+        #     kernel_probs = Dense(dim, activation='relu')(kernel_probs)
+        #     kernel_probs = Dropout(0.2)(kernel_probs)
 
-        kernel_probs = Dense(self.n_kernels, activation='softmax')(kernel_probs)
+        # kernel_probs = Dense(self.n_kernels, activation='softmax')(kernel_probs)
 
 
         # Specialist networks
@@ -236,17 +237,20 @@ class MultiHeadActor(object):
             specialist_outputs.append(specialist)
 
         # Gate and combine specialist outputs
-        gated_outputs = [
-            Lambda(lambda x: x[0] * x[1])([kernel_probs[:, i:i+1], specialist]) 
-            for i, specialist in enumerate(specialist_outputs)
-        ]
+        # gated_outputs = [
+        #     Lambda(lambda x: x[0] * x[1])([kernel_probs[:, i:i+1], specialist]) 
+        #     for i, specialist in enumerate(specialist_outputs)
+        # ]
 
-        combined_output = Concatenate(dtype=tf.float32)(gated_outputs)
-        output = Dense(4*self.out_dim*self.n_kernels, activation='relu')(combined_output)
+        combined_output = Concatenate(dtype=tf.float32)(specialist_outputs)
+        combined_output = Dense(4*(tf.round(self.out_dim/self.n_kernels))*self.n_kernels, activation='relu')(combined_output)
 
-        output = NoisyDense(self.out_dim, activation='relu')(output)
-        output = NoisyDense(self.out_dim, activation='relu')(output)
-        output = NoisyDense(self.out_dim, activation='tanh')(output)
+        noise = NoisyDense(self.out_dim, activation='relu')(combined_output)
+        noise = Dropout(0.2)(noise)
+        noise = NoisyDense(self.out_dim, activation='relu')(noise)
+        noise = Dropout(0.2)(noise)
+
+        output = Dense(self.out_dim, activation='tanh')(noise)
         output = Lambda(lambda x: x * self.act_range)(output)
 
         return Model(inputs=inp, outputs=output)
@@ -417,8 +421,8 @@ class DDPGAgent(object):
         # Initialize actor network
         self.actor = MultiHeadActor(
             inp_dim=self.state_dim, 
-            heads_nets_dims=[512, 256, 128, 64],
-            kernel_probs_net_dims = [16, 16],
+            heads_nets_dims=[256, 128, 64],
+            kernel_probs_net_dims = [16, 16, 8],
             out_dim=self.action_dim,
             n_kernels=self.n_kernels,
             act_range=self.action_max, 
@@ -572,7 +576,7 @@ class DDPGAgent(object):
                 new_observation, reward, done, _, _ = env.step(action.numpy())
                 
                 if steps > self.max_steps:
-                    reward = -50
+                    reward = -100
                     done = True
 
                 self.learn(observation, action.numpy(), reward, new_observation, done)
@@ -611,11 +615,11 @@ action_min = env.action_space.low
 action_max = env.action_space.high
 
 memory_size = 1000000
-batch_size = 128
+batch_size = 256
 gamma = 0.99
 a_lr = 1e-4
 c_lr = 1e-3
-tau = 5e-3
+tau = 3e-3
 max_steps = 1000
 n_kernels = 3
 
