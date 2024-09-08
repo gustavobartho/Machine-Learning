@@ -203,25 +203,32 @@ class MultiHeadActor(object):
         self.act_range = act_range  # Action range for scaling the output
         self.tau = tau  # Soft update parameter for target network
 
-        self.vae = VAE(input_dim=inp_dim, latent_dim=8, encoder_dims=[16, 8], lr=5e-4)
+        self.vae = VAE(input_dim=inp_dim, latent_dim=8, encoder_dims=[32, 16], lr=5e-4)
 
         self.model = self.buildNetwork()
         self.target_model = self.buildNetwork()
         self.target_model.set_weights(self.model.get_weights())
-        self.optimizer = Adam(learning_rate=lr)
+
+        self.lr_schedule = ExponentialDecay(
+            initial_learning_rate=lr,
+            decay_steps=100000,
+            decay_rate=0.99
+        )
+        self.optimizer = Adam(learning_rate=self.lr_schedule)
 
 
     def buildNetwork(self):
         inp = Input(shape=(self.inp_dim,))
-        # z, _, _ = self.vae.encoder(inp)
+        _, mean, logvar = self.vae.encoder(inp)
         
-        # # Kernel probabilities network
-        # kernel_probs = z
-        # for dim in self.kernel_probs_net_dims:
-        #     kernel_probs = Dense(dim, activation='relu')(kernel_probs)
-        #     kernel_probs = Dropout(0.2)(kernel_probs)
+        # Kernel probabilities network
+        #kernel_probs = Concatenate(dtype=tf.float32)([mean, logvar])
+        kernel_probs = inp
+        for dim in self.kernel_probs_net_dims:
+            kernel_probs = Dense(dim, activation='relu')(kernel_probs)
+            kernel_probs = Dropout(0.2)(kernel_probs)
 
-        # kernel_probs = Dense(self.n_kernels, activation='softmax')(kernel_probs)
+        kernel_probs = Dense(self.n_kernels, activation='sigmoid')(kernel_probs)
 
 
         # Specialist networks
@@ -237,20 +244,15 @@ class MultiHeadActor(object):
             specialist_outputs.append(specialist)
 
         # Gate and combine specialist outputs
-        # gated_outputs = [
-        #     Lambda(lambda x: x[0] * x[1])([kernel_probs[:, i:i+1], specialist]) 
-        #     for i, specialist in enumerate(specialist_outputs)
-        # ]
+        gated_outputs = [
+            Lambda(lambda x: x[0] * x[1])([kernel_probs[:, i:i+1], specialist]) 
+            for i, specialist in enumerate(specialist_outputs)
+        ]
 
-        combined_output = Concatenate(dtype=tf.float32)(specialist_outputs)
+        combined_output = Concatenate(dtype=tf.float32)(gated_outputs)
         combined_output = Dense(4*(tf.round(self.out_dim/self.n_kernels))*self.n_kernels, activation='relu')(combined_output)
 
-        noise = NoisyDense(self.out_dim, activation='relu')(combined_output)
-        noise = Dropout(0.2)(noise)
-        noise = NoisyDense(self.out_dim, activation='relu')(noise)
-        noise = Dropout(0.2)(noise)
-
-        output = Dense(self.out_dim, activation='tanh')(noise)
+        output = NoisyDense(self.out_dim, activation='tanh')(combined_output)
         output = Lambda(lambda x: x * self.act_range)(output)
 
         return Model(inputs=inp, outputs=output)
@@ -290,12 +292,12 @@ class Critic(object):
         # Set up learning rate schedule
         self.lr_schedule = ExponentialDecay(
             initial_learning_rate=lr,
-            decay_steps=10000,
+            decay_steps=100000,
             decay_rate=0.99
         )
         
         # Initialize optimizer
-        self.optimizer = Adam(learning_rate=lr)
+        self.optimizer = Adam(learning_rate=self.lr_schedule)
         
         # Parameter for soft updates of target network
         self.tau = tau
@@ -422,7 +424,7 @@ class DDPGAgent(object):
         self.actor = MultiHeadActor(
             inp_dim=self.state_dim, 
             heads_nets_dims=[256, 128, 64],
-            kernel_probs_net_dims = [16, 16, 8],
+            kernel_probs_net_dims = [16, 16],
             out_dim=self.action_dim,
             n_kernels=self.n_kernels,
             act_range=self.action_max, 
@@ -444,23 +446,28 @@ class DDPGAgent(object):
         )
 
         # Create plot for visualization
-        #self.create_plot()
+        self.create_plot()
 
 
     def create_plot(self):
         # Create a figure for SOM activation visualization
         self.fig = plt.figure()
-        self.som_act_plot = self.fig.add_subplot(211)
-        self.som_act_plot.title.set_text('SOM Activation')
 
-        self.kernel_plot = self.fig.add_subplot(212)
-        self.kernel_plot.title.set_text('Kernels centers')
+        self.returns = self.fig.add_subplot(211)
+        self.returns.title.set_text('Retruns')
+
+        self.n_steps = self.fig.add_subplot(212)
+        self.n_steps.title.set_text('N Steps')
+
+        self.fig.show()
         return
 
 
-    def update_plots(self, som_act):
+    def update_plots(self, returns, n_steps):
         # Update the SOM activation plot
-        self.som_act_plot.imshow(som_act)
+        self.returns.plot(np.arange(len(returns)), returns)
+
+        self.n_steps.plot(np.arange(len(returns)), n_steps)
 
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
@@ -483,7 +490,7 @@ class DDPGAgent(object):
             target_actions = self.actor.target_predict(next_states)
             y = tf.cast(rewards + self.gamma * self.critic.target_predict(next_states, target_actions) * (1 - dones), dtype=tf.float32)
             critic_value = tf.cast(self.critic.predict(states, actions), dtype=tf.float32)
-            critic_loss = tf.reduce_mean(weights * tf.square(y - critic_value))
+            critic_loss = tf.reduce_mean(tf.square(y - critic_value))
 
         critic_grad = tape.gradient(critic_loss, self.critic.model.trainable_variables)
         self.critic.optimizer.apply_gradients(zip(critic_grad, self.critic.model.trainable_variables))
@@ -576,7 +583,7 @@ class DDPGAgent(object):
                 new_observation, reward, done, _, _ = env.step(action.numpy())
                 
                 if steps > self.max_steps:
-                    reward = -100
+                    reward = -50
                     done = True
 
                 self.learn(observation, action.numpy(), reward, new_observation, done)
@@ -586,6 +593,7 @@ class DDPGAgent(object):
 
             scores_history.append(score)
             steps_history.append(steps)
+            self.update_plots(scores_history, steps_history)
             
             if score >= complete_value:
                 complete += 1
@@ -617,9 +625,9 @@ action_max = env.action_space.high
 memory_size = 1000000
 batch_size = 256
 gamma = 0.99
-a_lr = 1e-4
+a_lr = 5e-4
 c_lr = 1e-3
-tau = 3e-3
+tau = 1e-3
 max_steps = 1000
 n_kernels = 3
 
@@ -632,7 +640,7 @@ agent = DDPGAgent(
 
 num_episodes = 3000
 verbose = True
-verbose_num = 5
+verbose_num = 20
 end_on_complete = True
 complete_num = 2
 complete_value = 300
