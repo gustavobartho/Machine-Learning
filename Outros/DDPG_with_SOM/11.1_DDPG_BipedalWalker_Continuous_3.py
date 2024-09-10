@@ -227,14 +227,14 @@ class MultiHeadActor(object):
         for dim in self.kernel_probs_net_dims:
             kernel_probs = Dense(dim, activation='relu')(kernel_probs)
             kernel_probs = Dropout(0.2)(kernel_probs)
+        kernel_probs = Dense(self.n_kernels, activation='softmax')(kernel_probs)
 
-        kernel_probs = Dense(self.n_kernels, activation='sigmoid')(kernel_probs)
-
+        gated_inputs = [Lambda(lambda x: x[0] * x[1])([kernel_probs[:, i:i+1], inp]) for i in range(self.n_kernels)]
 
         # Specialist networks
         specialist_outputs = []
-        for _ in range(self.n_kernels):
-            specialist = inp
+        for gated_input in gated_inputs:
+            specialist = gated_input
             for dim in self.heads_nets_dims:
                 specialist = Dense(dim, activation='relu')(specialist)
                 specialist = Dropout(0.2)(specialist)
@@ -243,13 +243,7 @@ class MultiHeadActor(object):
             specialist = Dropout(0.2)(specialist)
             specialist_outputs.append(specialist)
 
-        # Gate and combine specialist outputs
-        gated_outputs = [
-            Lambda(lambda x: x[0] * x[1])([kernel_probs[:, i:i+1], specialist]) 
-            for i, specialist in enumerate(specialist_outputs)
-        ]
-
-        combined_output = Concatenate(dtype=tf.float32)(gated_outputs)
+        combined_output = Concatenate(dtype=tf.float32)(specialist_outputs)
         combined_output = Dense(4*(tf.round(self.out_dim/self.n_kernels))*self.n_kernels, activation='relu')(combined_output)
 
         output = NoisyDense(self.out_dim, activation='tanh')(combined_output)
@@ -490,7 +484,7 @@ class DDPGAgent(object):
             target_actions = self.actor.target_predict(next_states)
             y = tf.cast(rewards + self.gamma * self.critic.target_predict(next_states, target_actions) * (1 - dones), dtype=tf.float32)
             critic_value = tf.cast(self.critic.predict(states, actions), dtype=tf.float32)
-            critic_loss = tf.reduce_mean(tf.square(y - critic_value))
+            critic_loss = tf.reduce_mean(weights * tf.square(y - critic_value))
 
         critic_grad = tape.gradient(critic_loss, self.critic.model.trainable_variables)
         self.critic.optimizer.apply_gradients(zip(critic_grad, self.critic.model.trainable_variables))
